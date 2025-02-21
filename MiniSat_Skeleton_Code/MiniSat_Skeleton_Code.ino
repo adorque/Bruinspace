@@ -30,37 +30,51 @@
 #include "Adafruit_BMP280.h" //Use BMP3XX library if BMP3XX
 
 //Defining all the pin connections to Arduino
-#define GroundLED /*Enter pin*/               //LED indicating successful reception of communication on ground
-#define AirLED /*Enter pin*/                  //LED indicating successful reception of communication in air
-#define CutdownSignal /*Enter pin*/           //LED indicating whether cutdown has been triggered or not
-#define Relay /*Enter pin*/                   //Relay controlling togglable current to nichrome wire cutdown mechanism
-#define RX /*Enter pin*/                     //Receive pin for HC12 comms module
-#define TX /*Enter pin*/                     //Transmit pin for HC12 comms module
+// #define GroundLED                       //LED indicating successful reception of communication on ground
+#define AirLED 06                           //LED indicating successful reception of communication in air
+#define CutdownSignal 07                    //LED indicating whether cutdown has been triggered or not
+// #define Relay/*Enter pin*/                   //Relay controlling togglable current to nichrome wire cutdown mechanism
+#define RX 04                     //Receive pin for HC12 comms module
+#define TX 03                   //Transmit pin for HC12 comms module
 
 //Instantiating objects corresponding to sensors
-Adafruit_BMP280 /*BMP name*/;
-Adafruit_MPU6050 /*MPU name*/;
+Adafruit_BMP280 bmp; //BMP name
+Adafruit_MPU6050 mpu /*MPU name*/;
 SoftwareSerial HC12(TX, RX); // HC-12 TX Pin to Ar11, RX to Ar10
 
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 //System variable definitions
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
-const String satID = "/*Enter your ID here!*/";            //ID of the system, for the sake of distinguishing communication
-
-/*You don't need to edit below, but feel free to read through and add commands if you would like to!*/
-
-const int numCommands = 3;                //Number of valid commands
+const String satID = "GROUP 1 >:)";            //ID of the system, for the sake of distinguishing communication
+const int numCommands = 4;                //Number of valid commands
+int flightMode = 1;                       //Stores the phase of the mission, affects the data transmitted and the commands viable
+//[0] = Emergency phase
+//[1] = Ground Testing phase
+//[2] = Ascent
+//[3] = Cruise
+//[4] = Descent & Landing
+//[5] = Post-mission
+//String diagnostics;                     //Stores information of all the actions performed by the system, for analysis
+//String data;                            //Stores sensor data, for comparison to the data transmitted
+bool hasCutdown = false;                  //Flags whether the system has received the command to cutdown
 String commands[numCommands] = {          //Stores the list of all valid commands, each command requires a programmed response
+  "DIAG",                                     //Command to transmit diagnostic information to ground station
   "CUTDOWN",                                  //Command to trigger cutdown mechanism, which detaches system from balloon, initiating descent
   "RESETCUT",                                 //Command to reset cutdown state variable, allows cutdown command to be called again
   "PING"
 };
 
-bool hasCutdown = false;                  //Flags whether the system has received the command to cutdown
-String inCommand = "";                    //Temporarily stores the incoming command message
-char inChar;                              //Momentarily stores the incoming character when reading HC12 data
-int commandID = 0;                        //Temporarily stores the number position of the command
-bool messageEnd = false;                  //Flags whether the end of the message has been reached
+int cutdownTime;
+int launchTime;
+int initialAlt;
+int cruiseAlt;
+
+String inCommand = "";
+char inChar;
+int commandID = 0;
+bool messageEnd = false;
+
+const int P0 = (1013.25);            //in hPa (needed for readAltitude function)
 
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 //Essential functions
@@ -71,67 +85,65 @@ bool messageEnd = false;                  //Flags whether the end of the message
    @return  Formatted timestamp string
 */
 String getTimestamp() {
-  /* WRITE FUNCTION */
-  unsigned long elapsedTime = millis() / 1000;
-  int minutes = elapsedTime / 60;
-  int seconds = elapsedTime % 60;
-
-  return "T+" + string(minutes) + ":" + (seconds < 10 ? "0" : "") + string(seconds); 
+  int t = millis() / 1000;
+  String stamp = "T+";
+  stamp.concat(String(t / 60) + "m:");
+  stamp.concat(String(t % 60) + "s\t");
+  return stamp;
 }
+
 
 /**
    Transmits message always formatted with this satellite's ID
    @param msg The message to be transmitted
 */
 void sendMessage(String msg) {
-  /* WRITE FUNCTION */
-  String timestamp = getTimestamp();
-  String fullMessage = timestamp + " " + msg;
-
-  HC12.println(fullMessage);
-  Serial.println("Sent: " + fullMessage);
+  HC12.print(satID + "::" + getTimestamp() + "--");
+  while (msg != "") {
+    HC12.print(msg.substring(0, 8));
+    msg = msg.substring(8);
+  }
+  HC12.println();
 }
+
 
 /**
  * Seeks initial message from ground station, defines starting altitude, and sends first data values
 */
 void calibrate() {
   for (int att = 1; att < 11; att++) {      //Attempts 10 times to search for command from ground station
-
-    /* WRITE: Reads in message from HC12 character by character and stores the command in inCommand */
-    
-    if (inCommand.substring(0, 6) == "GROUND") {
-      digitalWrite(GroundLED, HIGH);
-      sendMessage("Test received! LED on!");
-      break;                                //Breaks out of the for loop
+    while (HC12.available()) {
+      inChar = HC12.read();
+      if (inChar == ":") {
+        break;
+      }
+      inCommand += inChar;
     }
-
-    /* WRITE: Reset the holding variables so you can search for the command in the next loop go-through */
+    if (inCommand.substring(0, 6) == "GROUND") {
+      // digitalWrite(GroundLED, HIGH);
+      sendMessage("Test received! LED on!");
+      break;
+    }
     inCommand = "";
+    inChar = NULL;
     delay(1000);
-
-
   }
 
   inCommand = "";
   inChar = NULL;
 
-  //Flushes out first three readings, since BMP tends to start with faulty values
-  for (int c = 1; c < 4; c++) {
-    bmp.performReading();
-  }
+  //Flushes out first three readings, since BMP tends to start with faulty value
+  // for (int c = 1; c < 4; c++) {
+  //   bmp.performReading();
+  // }
 
-  sendMessage("Beginning sensor readings...");
-  float temperature = bmp.temperature;
-  float pressure = bmp.pressure;
-  float altitude = bmp.altitude;
+  //Sets the initial altitude as a reference point for later comparisons
+  initialAlt = bmp.readAltitude(P0);
 
-  sendMessage("Temperature: " + String(temperature) + " °C");
-  sendMessage("Pressure: " + String(pressure) + " Pa");
-  sendMessage("Altitude: " + String(altitude) + " m");
-
-  /* WRITE: Send pressure, temperature, and altitude readings */
-  /* WRITE: Send a clear message that indicates the beginning of transmission */
+  sendMessage("Temperature: " + String(bmp.readTemperature()));
+  sendMessage("\tPressure: " +  String(bmp.readPressure()));
+  sendMessage("\tInitial Alt: " + String(initialAlt));
+  sendMessage("####### Flight Mode: Ground Test (1) #######");
 }
 
 
@@ -142,33 +154,22 @@ void calibrate() {
             false if the string is not a valid command
 */
 bool receiveCommand() {
-  while (Serial.available()) {
-    char inChar = Serial.read();
-    if (inChar == '\n'){
-      break;
-    }
-    commandID += inChar;
+  while (HC12.available()) {
+    //inCommand = HC12.readStringUntil('\n');
+    inChar = HC12.read();
+    inCommand += char(inChar);
+    //if (inChar == '\n') { messageEnd = true; }
   }
-  /* WRITE: Reads in message from HC12 character by character and stores the command in inCommand */
-  
-
   inChar = NULL;
-  bool commandFound = true;
-
   while (commandID < numCommands) {
-    if ( commandID == commands[commandID]) { /* WRITE: If the command matches the command in commands data structure... */ 
+    if (inCommand == ("GROUND::" + commands[commandID])) {
       break;
     }
-    commandID++;      //Iterate search index
+    commandID++;
   }
-  
-  if (!commandFound) {  /* WRITE: If the command is not found in commands data structure */ 
-    /* WRITE: Clear variable values */
-    Serial.println("Command not found: " + inCommand);
-
+  if (commandID == numCommands) {
     inCommand = "";
     commandID = 0;
-    
     return false;
   }
 
@@ -180,6 +181,39 @@ bool receiveCommand() {
 
 */
 void assessPhase() {
+  switch (flightMode) {
+    case 1:
+      if ( bmp.readAltitude(P0) - 2.5 > initialAlt ) {        //If 2.5 m higher than initially
+        flightMode++;
+        sendMessage("####### Flight mode: Ascent (2) #######");
+      }
+      break;
+    case 2:
+      if ( (millis() - 1000) > launchTime && (bmp.readAltitude(P0) > initialAlt - 0.5 && bmp.readAltitude(P0) < initialAlt + 0.5)) { // makes a 1m range to see if the position is constant.
+        flightMode++;
+        sendMessage("####### Flight mode: Cruise (3) #######");
+      }
+      break;
+    case 3:
+      if ((millis() - 1000) > launchTime && (bmp.readAltitude(P0) + 0.5 < initialAlt)) { //Checks if the payload has started to descend
+        flightMode++;
+        sendMessage("####### Flight mode: Descent and Landing (4) #######");
+      }
+      break;
+    case 4:
+      if ((millis() - 1000) > launchTime && (bmp.readAltitude(P0) > initialAlt - 0.5  && bmp.readAltitude(P0) < initialAlt + 0.5)){
+        flightMode++;
+      } // same logic as phase 3, checking for active movement from max height to ground
+      break;
+    case 5:
+      //phaseCheck = false;
+      //any additional end functions that need to be run
+      break;
+    default:        //Invalid phase value
+      //diagnostics += getTimestamp() + "ERR--\t Invalid phase value stored.\n";
+      break;
+  }
+
   //Cuts down in case the balloon gets too high
   if (bmp.readAltitude(P0) > 15 + initialAlt) {
     resetCutdown();
@@ -190,10 +224,20 @@ void assessPhase() {
   }
 }
 
+//Returns data from the accelerometer and bmp unit
 void transmitData() {
-  String data = "Hello from Group 1 Ground!!!";
-  Serial.println(data);
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  // bmp.performReading();
+
+  sendMessage("aX: " + String(a.acceleration.x)); //acceleration in the x-axis m/s^2
+  sendMessage("aY: " + String(a.acceleration.y)); //acceleration in the y-axis m/s^2
+  sendMessage("aZ: " + String(a.acceleration.z)); //acceleration in the z-axis m/s^2
+  sendMessage("T: " + String(bmp.readTemperature())); //temperature (C)
+  sendMessage("P: " + String(bmp.readPressure())); //pressure in Pa
+  sendMessage("H: " + String(bmp.readAltitude(P0))); //Height in meters
 }
+
 
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 //Command functions
@@ -204,20 +248,26 @@ void transmitData() {
 */
 void cutdown() {
   //Prevents cutdown if already triggered
-  if (!hasCutdown){
-    int relayTime = random(400, 1400);
-    digitalWrite(CutdownSignal, HIGH);
-    delay(relayTime);
-    digitalWrite(CutdownSignal, LOW);
-    digitalWrite(CutdownSignal, HIGH);
-    hasCutdown = true;
-    Serial.println("Cutdown triggered.");
+  if (hasCutdown) {
+    //diagnostics += getTimestamp() + "RDD--\t Attempted to cutdown when previously triggered\n";
+    return;
   }
-  /* WRITE: If the hasCutdown flag is true, do not execute anything */
-  /* WRITE: Send a signal to the relay for a brief amount of time (400-1400 ms) */
-  /* WRITE: Turn on the CutdownSignal LED */
-  /* WRITE: Update the flag */
-  /* WRITE: Send a clear message saying that cutdown was triggered */
+
+  //Prevents cutdown command while in or after descent
+  if (flightMode >= 4) {
+    //diagnostics += getTimestamp() + "ERR--\t Attempted to cutdown when in descent\n";
+    return;
+  }
+
+  cutdownTime = millis();
+  String logCut = getTimestamp();
+  // digitalWrite(Relay, HIGH);
+  digitalWrite(CutdownSignal, HIGH);    //Turn on cutdown LED
+  hasCutdown = true;                    //Indicate cutdown has been called for
+  delay(600);
+  // digitalWrite(Relay, LOW);
+  sendMessage("++++++++++++Cutdown++++++++++++");
+  //diagnostics += logCut + "CMD " + String(commandID) + " --\t Triggered cutdown\n";
 }
 
 
@@ -225,37 +275,26 @@ void cutdown() {
    Resets cutdown flag, unless the flag is already false
 */
 void resetCutdown() {
-  if (!hasCutdown){
-    Serial.println("Cutdown flag already reset");
+  //Informs if command was called despite value being already default (false)
+  if (!hasCutdown) {
+    //diagnostics += getTimestamp() + "RDD--\t Attempted to reset cutdown variable when already default value\n";
     return;
   }
-
   hasCutdown = false;
   digitalWrite(CutdownSignal, LOW);
-  Serial.println("Cutdown has been reset.");
-  /* WRITE: If the cutdown flag is already reset, send a message saying so*/
-  /* WRITE: Reset the flag and indicator LED to their FALSE, LOW states */
-  /* WRITE: Send a clear message saying that cutdown was reset */
+  sendMessage("++++++++++++Reset Cutdown++++++++++++");
+  //diagnostics += getTimestamp() + "CMD " + String(commandID) + " --\t Reset cutdown value\n";
 }
 
 /**
- * Responds with a "pong" and flashes the AirTest LED. Used to test two way communication between satellite and ground station
+ * Responds with a "pong." Used to test two way communication between satellite and ground station
  */
 void ping() {
-  Serial.println("pong");
-
-  digitalWrite(AirLED, HIGH);
-  delay(200);
-  digitalWrite(AirLED, LOW);
-  delay(200);
-  digitalWrite(AirLED, HIGH);
-  delay(200);
-  digitalWrite(AirLED, LOW);
-  delay(200);
-  digitalWrite(AirLED, HIGH);
-  delay(200);
-  digitalWrite(AirLED, LOW);
+  sendMessage("pong");
+  boolean state = (digitalRead(AirLED) == HIGH);
+  digitalWrite(AirLED, state ? LOW : HIGH); 
 }
+
 
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 //Command response function
@@ -268,13 +307,21 @@ void ping() {
 void respond(String cmd) {
   switch (commandID) {
     case 0:
-      cutdown();
+      //sendMessage(diagnostics);
       break;
     case 1:
-      resetCutdown();
+      cutdown();
       break;
     case 2:
+      resetCutdown();
+      break;
+    case 3:
       ping();
+      break;
+    case 4:
+    case 5:
+    default:    //Invalid command
+      //diagnostics += getTimestamp() + "ERR--\t Invalid command \"" + cmd + "\" processed through receiveCommand function.\n";
       break;
   }
   commandID = 0;
@@ -282,30 +329,31 @@ void respond(String cmd) {
   inChar = "";
 }
 
+
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 //Operation (Arduino default setup and loop functions)
 //––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
-
+//Runs when the Arduino is booted up
 void setup() {
 
   //Begin the comms module with a baud rate of 9600 signals/sec
   HC12.begin(9600);
 
   //Defining pin types
-  pinMode(GroundLED, OUTPUT);
+  // pinMode(GroundLED, OUTPUT);
   pinMode(AirLED, OUTPUT);
   pinMode(CutdownSignal, OUTPUT);
-  pinMode(Relay, OUTPUT);
+  // pinMode(Relay, OUTPUT);
 
   //Setting initial values for pins, all LOW
-  digitalWrite(GroundLED, LOW);
+  // digitalWrite(GroundLED, LOW);
   digitalWrite(AirLED, LOW);
   digitalWrite(CutdownSignal, LOW);
-  digitalWrite(Relay, LOW);
+  // digitalWrite(Relay, LOW);
 
   //Assess if the MPU and BMP sensors are able to communicate with Arduino
   bool mpuFound = mpu.begin();
-  bool bmpFound = bmp.begin_I2C();
+  bool bmpFound = bmp.begin();
   if (!mpuFound || !bmpFound) {
     if (!mpuFound) {
       sendMessage("MPU not found, check wiring");
@@ -322,6 +370,7 @@ void setup() {
   sendMessage("Begin");
 }
 
+//will continuously run as long as the arduino is still powered and recieving data
 void loop() {
   if (receiveCommand()) {
     respond(inCommand);
@@ -329,4 +378,9 @@ void loop() {
   assessPhase();
   transmitData();
   delay(500);
+  
+  //Uncomment to test transmit and receive
+  //sendMessage("hi");
+  //String message = HC12.readString();
+  //sendMessage(message);
 }
